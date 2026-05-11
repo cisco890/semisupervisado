@@ -1,0 +1,390 @@
+---
+title: "Propagación de Etiquetas en R"
+author: "Ejemplo semi-supervisado"
+output:
+  html_document:
+    theme: default
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+```{r librerias}
+library(ggplot2)
+library(dplyr)
+```
+
+# Propagación de Etiquetas en R
+
+## 1. Introducción
+
+En este documento se implementa un método de **aprendizaje semi-supervisado**: solo una pequeña fracción de los datos tiene etiqueta conocida y el resto se trata como no etiquetado. El algoritmo de **Propagación de Etiquetas** aprovecha la geometría de *todos* los puntos (etiquetados y no etiquetados) para difundir información desde los conocidos hacia los desconocidos.
+
+No se entrena un clasificador supervisado clásico (por ejemplo, una frontera global estimada solo con los etiquetados). En su lugar, se construye un **grafo** cuyos nodos son las observaciones y cuyas aristas ponderan la **similitud** entre pares de puntos; las etiquetas iniciales se **propagan** por el grafo hasta estabilizarse. El enfoque es en gran medida **transductivo**: las predicciones se obtienen para los mismos puntos que participaron en la construcción del grafo.
+
+## 2. Generación de datos sintéticos
+
+Se generan dos clases con forma de **dos medias lunas**, útil para ilustrar comportamiento no lineal. La reproducibilidad se fija con `set.seed(123)`.
+
+```{r datos-sinteticos}
+set.seed(123)
+
+n <- 120
+ruido <- 0.08
+
+theta_1 <- runif(n, 0, pi)
+theta_2 <- runif(n, 0, pi)
+
+clase_1 <- data.frame(
+  x1 = cos(theta_1) + rnorm(n, 0, ruido),
+  x2 = sin(theta_1) + rnorm(n, 0, ruido),
+  clase_real = "Clase A"
+)
+
+clase_2 <- data.frame(
+  x1 = 1 - cos(theta_2) + rnorm(n, 0, ruido),
+  x2 = -sin(theta_2) + 0.5 + rnorm(n, 0, ruido),
+  clase_real = "Clase B"
+)
+
+datos <- rbind(clase_1, clase_2)
+datos$id <- 1:nrow(datos)
+```
+
+```{r grafico-datos-reales, fig.height=4.5, fig.width=6}
+ggplot(datos, aes(x = x1, y = x2, color = clase_real)) +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(
+    title = "Datos sintéticos con clase real",
+    x = "Variable 1",
+    y = "Variable 2",
+    color = "Clase real"
+  ) +
+  theme_minimal()
+```
+
+## 3. Selección de datos etiquetados y no etiquetados
+
+Se eligen **tres** observaciones etiquetadas por clase; el resto queda sin etiqueta observada. La columna `clase_real` se conserva únicamente para evaluación.
+
+```{r etiquetados}
+set.seed(123)
+
+etiquetados <- datos %>%
+  group_by(clase_real) %>%
+  slice_sample(n = 3) %>%
+  ungroup()
+
+datos$clase_observada <- NA
+datos$clase_observada[datos$id %in% etiquetados$id] <- datos$clase_real[datos$id %in% etiquetados$id]
+
+datos$tipo <- ifelse(is.na(datos$clase_observada), "No etiquetado", "Etiquetado")
+```
+
+```{r tablas-tipo}
+table(datos$tipo)
+table(datos$clase_observada, useNA = "ifany")
+```
+
+```{r grafico-etiquetados, fig.height=4.5, fig.width=6}
+ggplot(datos, aes(x = x1, y = x2)) +
+  geom_point(aes(color = clase_observada), size = 2, alpha = 0.8) +
+  geom_point(
+    data = datos %>% filter(tipo == "No etiquetado"),
+    color = "gray70",
+    size = 1.8,
+    alpha = 0.5
+  ) +
+  labs(
+    title = "Puntos etiquetados y no etiquetados",
+    x = "Variable 1",
+    y = "Variable 2",
+    color = "Etiqueta observada"
+  ) +
+  theme_minimal()
+```
+
+## 4. Construcción del grafo de similitud
+
+La matriz de similitud **W** usa un núcleo gaussiano sobre la distancia euclídea al cuadrado:
+
+\[
+W_{ij} = \exp\left(-\frac{d_{ij}^2}{2\sigma^2}\right)
+\]
+
+donde \(d_{ij}\) es la distancia entre los puntos \(i\) y \(j\), y \(\sigma\) controla qué tan **local** es la similitud: \(\sigma\) muy pequeño produce un grafo muy disperso; \(\sigma\) muy grande acerca demasiado los pesos entre nodos lejanos.
+
+```{r grafo}
+X <- as.matrix(datos[, c("x1", "x2")])
+
+distancias <- as.matrix(dist(X))
+distancias_2 <- distancias^2
+
+sigma <- median(distancias[distancias > 0])
+
+W <- exp(-distancias_2 / (2 * sigma^2))
+diag(W) <- 0
+```
+
+```{r verificar-W}
+dim(W)
+summary(diag(W))
+```
+
+## 5. Implementación del algoritmo de Propagación de Etiquetas
+
+Se construye la matriz **Y** de etiquetas iniciales (indicadores one-hot por fila). Los nodos no etiquetados tienen filas de ceros. Se normaliza el grafo con la matriz simétrica **S** = \(D^{-1/2} W D^{-1/2}\), donde **D** es diagonal con los grados (suma de pesos por fila de **W**).
+
+La iteración sigue la forma de **consistencia local y global**:
+
+\[
+F^{(t+1)} = \alpha S F^{(t)} + (1-\alpha) Y
+\]
+
+con \(\alpha \in (0,1)\): un \(\alpha\) alto da más peso a la estructura del grafo; \((1-\alpha)Y\) ancla las etiquetas conocidas.
+
+```{r matriz-Y}
+clases <- sort(unique(datos$clase_real))
+labeled_idx <- which(!is.na(datos$clase_observada))
+
+Y <- matrix(0, nrow = nrow(datos), ncol = length(clases))
+colnames(Y) <- clases
+
+Y[cbind(labeled_idx, match(datos$clase_observada[labeled_idx], clases))] <- 1
+```
+
+```{r normalizacion-S}
+grados <- rowSums(W)
+D_inv_sqrt <- diag(1 / sqrt(grados + 1e-12))
+
+S <- D_inv_sqrt %*% W %*% D_inv_sqrt
+```
+
+```{r iteracion}
+alpha <- 0.95
+max_iter <- 1000
+tol <- 1e-6
+
+F <- Y
+
+for (iter in 1:max_iter) {
+  F_anterior <- F
+
+  F <- alpha * S %*% F + (1 - alpha) * Y
+
+  cambio <- max(abs(F - F_anterior))
+
+  if (cambio < tol) {
+    break
+  }
+}
+
+iter
+cambio
+```
+
+```{r prediccion}
+pred_idx <- max.col(F, ties.method = "first")
+datos$clase_predicha <- clases[pred_idx]
+
+datos$confianza <- apply(F, 1, max) / pmax(rowSums(F), 1e-12)
+```
+
+## 6. Visualización de resultados
+
+```{r resultado-lp, fig.height=4.5, fig.width=7}
+ggplot(datos, aes(x = x1, y = x2, color = clase_predicha)) +
+  geom_point(aes(size = confianza, shape = tipo), alpha = 0.8) +
+  labs(
+    title = "Resultado de Propagación de Etiquetas",
+    x = "Variable 1",
+    y = "Variable 2",
+    color = "Clase predicha",
+    shape = "Tipo de dato",
+    size = "Confianza"
+  ) +
+  theme_minimal()
+```
+
+```{r comparacion-real-predicha, fig.height=4, fig.width=8}
+ggplot(datos, aes(x = x1, y = x2)) +
+  geom_point(aes(color = clase_predicha), size = 2, alpha = 0.8) +
+  facet_wrap(~ clase_real) +
+  labs(
+    title = "Comparación entre clase real y clase predicha",
+    x = "Variable 1",
+    y = "Variable 2",
+    color = "Clase predicha"
+  ) +
+  theme_minimal()
+```
+
+## 7. Evaluación sencilla
+
+La métrica principal es el acierto en los puntos **no etiquetados**, que son los que el método debía inferir.
+
+```{r evaluacion}
+unlabeled_idx <- which(is.na(datos$clase_observada))
+
+accuracy_unlabeled <- mean(datos$clase_predicha[unlabeled_idx] == datos$clase_real[unlabeled_idx])
+accuracy_total <- mean(datos$clase_predicha == datos$clase_real)
+
+accuracy_unlabeled
+accuracy_total
+```
+
+```{r confusion}
+table(
+  Real = datos$clase_real[unlabeled_idx],
+  Predicha = datos$clase_predicha[unlabeled_idx]
+)
+```
+
+## 8. Interpretación
+
+1. **Puntos etiquetados**: se tomaron tres observaciones al azar por clase (`slice_sample(n = 3)` dentro de cada `clase_real`), fijando la semilla para reproducibilidad.
+2. **Grafo**: se calculó la distancia euclídea entre todos los pares de puntos en \((x_1, x_2)\) y se transformó en pesos gaussianos; la diagonal de **W** es cero (sin bucles).
+3. **Matriz W**: similitud pareada; valores altos indican vecinos cercanos en el sentido del núcleo gaussiano.
+4. **Matriz S**: versión normalizada simétrica del grafo, que equilibra el peso de nodos con distinto grado antes de difundir etiquetas.
+5. **Actualización iterativa**: en cada paso, **F** mezcla la difusión por **S** con el anclaje **Y**; al converger, **F** refleja a la vez suavidad en el grafo y respeto a las etiquetas fijas.
+6. **Puntos no etiquetados**: reciben clase porque sus filas en **F** se van alineando con vecinos similares en el grafo, arrastrados por la propagación desde los sembrados etiquetados.
+7. **Rendimiento**: el `accuracy_unlabeled` cuantifica qué tan bien se recuperó la `clase_real` en los no observados (ver chunk anterior).
+8. **Menos etiquetados**: con `slice_sample(n = 1)` el anclaje es más débil y el error suele subir si los únicos sembrados no representan bien cada región de la media luna.
+9. **Sigma**: muy pequeño fragmenta el grafo (poca difusión entre regiones); muy grande une demasiado y puede mezclar ambas lunas en el espectro de **W**.
+10. **Alpha**: valores bajas acercan **F** a **Y** (poca suavidad); valores altas acentúan la consistencia con vecinos pero pueden amplificar errores si el grafo conecta mal clases distintas.
+
+En conjunto, el método rinde bien cuando **la similitud en el grafo refleja la verdadera estructura de clases** (vecinos del mismo semicírculo comparten etiqueta).
+
+## 9. Conclusiones
+
+- La Propagación de Etiquetas incorpora los datos **no etiquetados** en el propio mecanismo de inferencia, no solo como puntos futuros a clasificar con un modelo ajustado solo con etiquetados.
+- Se apoya en la hipótesis de **suavidad**: observaciones similares deberían compartir etiqueta en el grafo.
+- La elección de **W** (y por tanto de \(\sigma\)) es central: define quién influye a quién.
+- Con **pocos** puntos etiquetados puede clasificarse gran parte del conjunto si la forma de las clases es clara y el grafo la respeta.
+- Si el grafo **conecta en exceso** regiones de distinta clase, la difusión mezcla etiquetas y el error aumenta.
+
+---
+
+## Experimentos adicionales
+
+Tres variaciones rápidas sobre la misma semilla y datos base (se reejecuta el flujo desde la selección de etiquetados o desde **W** según corresponda).
+
+### Experimento 1: Cantidad de puntos etiquetados
+
+```{r exp1-k-etiquetados}
+run_lp <- function(k_etiq) {
+  set.seed(123)
+  etiquetados_k <- datos %>%
+    group_by(clase_real) %>%
+    slice_sample(n = k_etiq) %>%
+    ungroup()
+
+  clase_obs <- rep(NA_character_, nrow(datos))
+  clase_obs[datos$id %in% etiquetados_k$id] <-
+    datos$clase_real[datos$id %in% etiquetados_k$id]
+
+  labeled <- which(!is.na(clase_obs))
+  Yk <- matrix(0, nrow = nrow(datos), ncol = length(clases))
+  colnames(Yk) <- clases
+  Yk[cbind(labeled, match(clase_obs[labeled], clases))] <- 1
+
+  Fk <- Yk
+  for (it in 1:max_iter) {
+    Fprev <- Fk
+    Fk <- alpha * S %*% Fk + (1 - alpha) * Yk
+    if (max(abs(Fk - Fprev)) < tol) break
+  }
+  pred_k <- clases[max.col(Fk, ties.method = "first")]
+  unlab <- which(is.na(clase_obs))
+  mean(pred_k[unlab] == datos$clase_real[unlab])
+}
+
+data.frame(
+  k_por_clase = c(1, 3, 5),
+  accuracy_no_etiq = c(run_lp(1), run_lp(3), run_lp(5))
+)
+```
+
+### Experimento 2: Escala de sigma
+
+```{r exp2-sigma}
+sigma_base <- median(distancias[distancias > 0])
+
+run_lp_sigma <- function(sigma_mult) {
+  sig <- sigma_base * sigma_mult
+  Ws <- exp(-distancias_2 / (2 * sig^2))
+  diag(Ws) <- 0
+  gs <- rowSums(Ws)
+  Ds <- diag(1 / sqrt(gs + 1e-12))
+  Ss <- Ds %*% Ws %*% Ds
+
+  Fk <- Y
+  for (it in 1:max_iter) {
+    Fprev <- Fk
+    Fk <- alpha * Ss %*% Fk + (1 - alpha) * Y
+    if (max(abs(Fk - Fprev)) < tol) break
+  }
+  pred_k <- clases[max.col(Fk, ties.method = "first")]
+  mean(pred_k[unlabeled_idx] == datos$clase_real[unlabeled_idx])
+}
+
+data.frame(
+  sigma_factor = c(0.5, 1, 2),
+  accuracy_no_etiq = c(
+    run_lp_sigma(0.5),
+    run_lp_sigma(1),
+    run_lp_sigma(2)
+  )
+)
+```
+
+### Experimento 3: Valor de alpha
+
+```{r exp3-alpha}
+run_lp_alpha <- function(al) {
+  Fa <- Y
+  for (it in 1:max_iter) {
+    Fprev <- Fa
+    Fa <- al * S %*% Fa + (1 - al) * Y
+    if (max(abs(Fa - Fprev)) < tol) break
+  }
+  pred_a <- clases[max.col(Fa, ties.method = "first")]
+  mean(pred_a[unlabeled_idx] == datos$clase_real[unlabeled_idx])
+}
+
+data.frame(
+  alpha = c(0.50, 0.80, 0.95, 0.99),
+  accuracy_no_etiq = c(
+    run_lp_alpha(0.50),
+    run_lp_alpha(0.80),
+    run_lp_alpha(0.95),
+    run_lp_alpha(0.99)
+  )
+)
+```
+
+Con **alpha** entre 0.8 y 0.99 el esquema suele converger en pocas centenas de iteraciones con la tolerancia usada; valores extremos cambian el equilibrio entre anclaje a **Y** y suavidad vía **S**, lo que se refleja en la tabla.
+
+---
+
+## Validaciones mínimas
+
+```{r validaciones}
+sum(is.na(datos$clase_predicha))
+dim(W)
+dim(S)
+dim(Y)
+dim(F)
+iter < max_iter
+```
+
+---
+
+## Referencias
+
+- Zhu, X., & Ghahramani, Z. (2003). *Learning from Labeled and Unlabeled Data with Label Propagation*.
+- Zhou, D., Bousquet, O., Lal, T. N., Weston, J., & Schölkopf, B. (2004). *Learning with Local and Global Consistency*. Advances in Neural Information Processing Systems, 16.
+- van Engelen, J. E., & Hoos, H. H. (2020). *A survey on semi-supervised learning*. Machine Learning, 109(2), 373–440. https://doi.org/10.1007/s10994-019-05855-6
